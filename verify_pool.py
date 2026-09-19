@@ -435,234 +435,105 @@ def parse_coinbase_script_suffix(coinb2_hex: str) -> dict:
         return {'error': str(e)}
 
 
-def parse_coinbase_outputs(coinb2_hex: str, coinb1_hex: str = None) -> list:
+def read_varint(data: bytes, pos: int) -> Tuple[int, int]:
     """
-    Parse the outputs from coinbase transaction (coinb2).
-    Returns list of output dictionaries.
-    
-    Coinb2 structure varies by pool:
-    - Standard: [extranonce][sequence 4][output_count 1][outputs...][locktime 4]
-    - SoloHash: sequence in coinb1, coinb2 = [extranonce][output_count][outputs...][locktime]
-    
-    Each output: [8 bytes value][1-9 bytes script_len][script]
+    Read a Bitcoin CompactSize (varint) from data at pos.
+    Returns (value, new_pos).
+    Raises IndexError if there aren't enough bytes.
+    """
+    prefix = data[pos]
+    pos += 1
+    if prefix < 0xfd:
+        return prefix, pos
+    if prefix == 0xfd:
+        return int.from_bytes(data[pos:pos + 2], 'little'), pos + 2
+    if prefix == 0xfe:
+        return int.from_bytes(data[pos:pos + 4], 'little'), pos + 4
+    # 0xff
+    return int.from_bytes(data[pos:pos + 8], 'little'), pos + 8
+
+
+def parse_coinbase_outputs(coinb2_hex: str, coinb1_hex: str = None,
+                           extranonce1_hex: str = "",
+                           extranonce2_size: int = 0) -> list:
+    """
+    Parse the outputs from the coinbase transaction.
+
+    In Stratum, the full serialized coinbase transaction a miner builds is:
+
+        coinbase = coinb1 + extranonce1 + extranonce2 + coinb2
+
+    The extranonce bytes are placed at the coinb1/coinb2 boundary and live
+    *inside* the coinbase input script. Different pools split the coinbase at
+    different points (some put the entire input script in coinb1, some split
+    the script across the boundary, and some like RabidMining even let the
+    outputs straddle the boundary), so heuristics that scan only coinb2 for a
+    sequence marker are fragile and fail on layouts they weren't tuned for.
+
+    This function instead reconstructs the real transaction (using extranonce1
+    and extranonce2_size from the mining.subscribe response, with the
+    extranonce2 region filled with zero placeholder bytes) and walks it
+    linearly the same way Bitcoin Core deserializes a transaction:
+
+        version(4) | input_count(varint) | prev_hash(32) | prev_index(4) |
+        script_len(varint) | script(script_len) | sequence(4) |
+        output_count(varint) | [value(8) | script_len(varint) | script]... |
+        locktime(4)
+
+    Because the extranonce contents do not affect the position of the outputs
+    (they sit before the input's sequence field), a zero-filled placeholder of
+    the correct total size is sufficient to locate and decode every output.
+
+    Returns a list of output dictionaries, or [] if parsing fails.
     """
     try:
+        coinb1_bytes = binascii.unhexlify(coinb1_hex) if coinb1_hex else b""
         coinb2_bytes = binascii.unhexlify(coinb2_hex)
-        outputs = []
-        
-        # Method 0: Check for SoloHash format (sequence marker early in coinb2)
-        # SoloHash format: coinb2 = [script_suffix][sequence 4][output_count 1][outputs][locktime 4]
-        # The sequence marker appears early in coinb2 (after script suffix), not at the end of coinb1
-        try:
-            # Search for sequence marker in coinb2
-            sequence_pos = -1
-            for i in range(min(50, len(coinb2_bytes) - 4)):  # Check first 50 bytes
-                if (coinb2_bytes[i:i+4] == b'\x00\x00\x00\x00' or
-                    coinb2_bytes[i:i+4] == b'\xff\xff\xff\xff' or
-                    coinb2_bytes[i:i+4] == b'\xfe\xff\xff\xff' or
-                    coinb2_bytes[i:i+4] == b'\xff\xff\xff\xfe'):
-                    # Check if next byte looks like output count (1-20)
-                    if i + 4 < len(coinb2_bytes):
-                        potential_output_count = coinb2_bytes[i+4]
-                        if 1 <= potential_output_count <= 20:
-                            sequence_pos = i
-                            break
-            
-            if sequence_pos != -1:
-                # Found potential SoloHash format
-                output_count = coinb2_bytes[sequence_pos + 4]
-                pos = sequence_pos + 5  # Start of outputs
-                test_pos = pos
-                valid = True
-                
-                # Validate output structure
-                for _ in range(output_count):
-                    if test_pos + 8 > len(coinb2_bytes):
-                        valid = False
-                        break
-                    
-                    value = int.from_bytes(coinb2_bytes[test_pos:test_pos+8], 'little')
-                    test_pos += 8
-                    
-                    if test_pos >= len(coinb2_bytes):
-                        valid = False
-                        break
-                    
-                    script_len = coinb2_bytes[test_pos]
-                    test_pos += 1
-                    
-                    # Sanity check script length
-                    if script_len > 200 or test_pos + script_len > len(coinb2_bytes):
-                        valid = False
-                        break
-                    
-                    test_pos += script_len
-                
-                # Check if we end at locktime (4 bytes remaining)
-                if valid and len(coinb2_bytes) - test_pos == 4:
-                    # This is SoloHash format! Parse the outputs
-                    pos = sequence_pos + 5
-                    
-                    for _ in range(output_count):
-                        if pos + 8 > len(coinb2_bytes):
-                            break
-                        
-                        value = int.from_bytes(coinb2_bytes[pos:pos+8], 'little')
-                        pos += 8
-                        
-                        if pos >= len(coinb2_bytes):
-                            break
-                        
-                        script_len = coinb2_bytes[pos]
-                        pos += 1
-                        
-                        if pos + script_len > len(coinb2_bytes):
-                            break
-                        
-                        script = coinb2_bytes[pos:pos+script_len]
-                        pos += script_len
-                        
-                        addr_type, addr_data = decode_script(script)
-                        
-                        outputs.append({
-                            'value_satoshis': value,
-                            'value_btc': value / 100000000,
-                            'script_hex': script.hex(),
-                            'address_type': addr_type,
-                            'address_data': addr_data
-                        })
-                    
-                    if outputs:
-                        return outputs
-        except:
-            pass  # Fall through to other methods
-        
-        # Method 1: Standard format with sequence marker search
-        # Try to find where outputs start by looking for sequence and testing positions
-        if coinb1_hex:
-            try:
-                coinb1_bytes = binascii.unhexlify(coinb1_hex)
-                
-                if len(coinb1_bytes) >= 42:
-                    script_len = coinb1_bytes[41]
-                    script_in_coinb1 = len(coinb1_bytes) - 42
-                    script_remaining = max(0, script_len - script_in_coinb1)
-                    
-                    # Try different extranonce sizes
-                    for extranonce_size in [8, 4, 12, 16, 0]:
-                        pos = script_remaining + extranonce_size + 4  # script + extranonce + sequence
-                        
-                        if pos >= len(coinb2_bytes):
-                            continue
-                        
-                        output_count = coinb2_bytes[pos]
-                        
-                        if output_count > 0 and output_count <= 20:
-                            test_pos = pos + 1
-                            valid = True
-                            
-                            for _ in range(output_count):
-                                if test_pos + 8 > len(coinb2_bytes):
-                                    valid = False
-                                    break
-                                
-                                value = int.from_bytes(coinb2_bytes[test_pos:test_pos+8], 'little')
-                                test_pos += 8
-                                
-                                if test_pos >= len(coinb2_bytes):
-                                    valid = False
-                                    break
-                                    
-                                script_len_out = coinb2_bytes[test_pos]
-                                test_pos += 1
-                                
-                                if script_len_out > 200 or test_pos + script_len_out > len(coinb2_bytes):
-                                    valid = False
-                                    break
-                                
-                                test_pos += script_len_out
-                            
-                            if valid and len(coinb2_bytes) - test_pos <= 4:
-                                pos += 1
-                                
-                                for _ in range(output_count):
-                                    if pos + 8 > len(coinb2_bytes):
-                                        break
-                                    
-                                    value = int.from_bytes(coinb2_bytes[pos:pos+8], 'little')
-                                    pos += 8
-                                    
-                                    if pos >= len(coinb2_bytes):
-                                        break
-                                    script_len_out = coinb2_bytes[pos]
-                                    pos += 1
-                                    
-                                    if pos + script_len_out > len(coinb2_bytes):
-                                        break
-                                    
-                                    script = coinb2_bytes[pos:pos+script_len_out]
-                                    pos += script_len_out
-                                    
-                                    addr_type, addr_data = decode_script(script)
-                                    
-                                    outputs.append({
-                                        'value_satoshis': value,
-                                        'value_btc': value / 100000000,
-                                        'script_hex': script.hex(),
-                                        'address_type': addr_type,
-                                        'address_data': addr_data
-                                    })
-                                
-                                return outputs
-            except:
-                pass
-        
-        # Method 2: Search for standard sequence marker (0xffffffff or 0xfffffffe)
+        extranonce1_bytes = binascii.unhexlify(extranonce1_hex) if extranonce1_hex else b""
+        extranonce2_bytes = bytes(extranonce2_size or 0)
+
+        # Reconstruct the full serialized coinbase transaction.
+        tx = coinb1_bytes + extranonce1_bytes + extranonce2_bytes + coinb2_bytes
+
         pos = 0
-        found_sequence = False
-        
-        for i in range(len(coinb2_bytes) - 4):
-            if (coinb2_bytes[i:i+4] == b'\xff\xff\xff\xff' or
-                coinb2_bytes[i:i+4] == b'\xfe\xff\xff\xff' or
-                coinb2_bytes[i:i+4] == b'\xff\xff\xff\xfe'):
-                pos = i + 4  # Start after sequence
-                found_sequence = True
-                break
-        
-        if not found_sequence:
-            return []
-        
-        # Read output count (varint)
-        if pos >= len(coinb2_bytes):
-            return []
-            
-        output_count = coinb2_bytes[pos]
-        pos += 1
-        
+
+        # version (4 bytes)
+        pos += 4
+
+        # input count (varint) - coinbase always has exactly 1 input
+        input_count, pos = read_varint(tx, pos)
+
+        # For each input: prev_hash(32) + prev_index(4) + script_len(varint) +
+        # script + sequence(4). The coinbase has a single input.
+        for _ in range(input_count):
+            pos += 32  # previous output hash (all zeros for coinbase)
+            pos += 4   # previous output index (0xffffffff for coinbase)
+            script_len, pos = read_varint(tx, pos)
+            pos += script_len  # input script (includes the extranonce region)
+            pos += 4   # sequence
+
+        # output count (varint)
+        output_count, pos = read_varint(tx, pos)
+
+        outputs = []
         for _ in range(output_count):
-            if pos + 8 > len(coinb2_bytes):
-                break
-                
-            # Read value (8 bytes, little-endian)
-            value = int.from_bytes(coinb2_bytes[pos:pos+8], 'little')
+            if pos + 8 > len(tx):
+                # Ran off the end - reconstruction/sizes are inconsistent.
+                return []
+            value = int.from_bytes(tx[pos:pos + 8], 'little')
             pos += 8
-            
-            # Read script length (varint - simplified, assumes < 253)
-            if pos >= len(coinb2_bytes):
-                break
-            script_len = coinb2_bytes[pos]
-            pos += 1
-            
-            if pos + script_len > len(coinb2_bytes):
-                break
-                
-            # Read script
-            script = coinb2_bytes[pos:pos+script_len]
+
+            if pos >= len(tx):
+                return []
+            script_len, pos = read_varint(tx, pos)
+
+            if pos + script_len > len(tx):
+                return []
+            script = tx[pos:pos + script_len]
             pos += script_len
-            
-            # Decode script type and address
+
             addr_type, addr_data = decode_script(script)
-            
+
             outputs.append({
                 'value_satoshis': value,
                 'value_btc': value / 100000000,
@@ -670,11 +541,33 @@ def parse_coinbase_outputs(coinb2_hex: str, coinb1_hex: str = None) -> list:
                 'address_type': addr_type,
                 'address_data': addr_data
             })
-        
+
+        # Sanity check: exactly the 4-byte locktime should remain. If not, the
+        # extranonce size was wrong or the data is malformed.
+        if len(tx) - pos != 4:
+            return []
+
         return outputs
-        
-    except Exception as e:
+
+    except Exception:
         return []
+
+
+def extract_extranonce(subscribe_response: Optional[dict]) -> Tuple[str, int]:
+    """
+    Pull extranonce1 (hex) and extranonce2_size (bytes) from a mining.subscribe
+    response. The result array is [subscription_details, extranonce1,
+    extranonce2_size]. Returns ("", 0) if unavailable.
+    """
+    try:
+        result = subscribe_response.get('result')
+        if isinstance(result, list) and len(result) >= 3:
+            extranonce1 = result[1] if isinstance(result[1], str) else ""
+            extranonce2_size = int(result[2]) if result[2] is not None else 0
+            return extranonce1, extranonce2_size
+    except Exception:
+        pass
+    return "", 0
 
 
 def decode_script(script: bytes) -> tuple:
@@ -1503,7 +1396,8 @@ def test_all_address_types(host: str, port: int, timeout: int, password: str) ->
         # Parse outputs
         coinb1 = notify_params[2]
         coinb2 = notify_params[3]
-        outputs = parse_coinbase_outputs(coinb2, coinb1)
+        extranonce1, extranonce2_size = extract_extranonce(subscribe_response)
+        outputs = parse_coinbase_outputs(coinb2, coinb1, extranonce1, extranonce2_size)
         
         if not outputs:
             print(f"  ⚠️  Authorized but could not parse outputs")
@@ -1958,8 +1852,10 @@ Note: This tool performs a basic verification. For complete security, you should
     # Step 5: Parse and verify coinbase outputs
     print("\n[5/5] Parsing coinbase transaction outputs...")
     
-    # Parse the outputs from coinb2
-    outputs = parse_coinbase_outputs(coinb2, coinb1)
+    # Reconstruct the full coinbase (coinb1 + extranonce1 + extranonce2 + coinb2)
+    # and parse its outputs deterministically.
+    extranonce1, extranonce2_size = extract_extranonce(subscribe_response)
+    outputs = parse_coinbase_outputs(coinb2, coinb1, extranonce1, extranonce2_size)
     
     if not outputs:
         print("❌ Could not parse coinbase outputs")
