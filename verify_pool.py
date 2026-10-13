@@ -70,7 +70,15 @@ import time
 import binascii
 import argparse
 import statistics
+import ssl
 from typing import Optional, Tuple, Dict, List
+
+# Coin being verified: "BTC" (default) or "BCH". Set from the command line in main().
+# BCH mode is switched on by --coin bch, or automatically when a CashAddr address is given.
+COIN = "BTC"
+
+# When True, connect to the pool over TLS (stratum+ssl) and verify its certificate.
+USE_TLS = False
 
 
 def connect_and_subscribe(host: str, port: int, timeout: int = 10) -> Tuple[Optional[socket.socket], Optional[dict]]:
@@ -87,7 +95,13 @@ def connect_and_subscribe(host: str, port: int, timeout: int = 10) -> Tuple[Opti
         sock = socket.socket(af, socktype, proto)
         sock.settimeout(timeout)
         sock.connect(sockaddr)
-        
+
+        if USE_TLS:
+            # Encrypt the connection and check the pool's certificate matches the
+            # hostname, so nothing in the middle can alter the work we receive.
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=host)
+
         # Send mining.subscribe
         subscribe_msg = json.dumps({
             "id": 1,
@@ -131,7 +145,15 @@ def connect_and_subscribe(host: str, port: int, timeout: int = 10) -> Tuple[Opti
                     continue
         
         return sock, None
-        
+
+    except ssl.SSLCertVerificationError as e:
+        print(f"    ❌ TLS certificate check failed: {e.verify_message}")
+        print(f"       The certificate presented does not prove this is {host}.")
+        return None, None
+    except ssl.SSLError as e:
+        print(f"    ❌ TLS connection failed: {e}")
+        print("       Check the port supports TLS (stratum+ssl).")
+        return None, None
     except Exception:
         return None, None
 
@@ -677,7 +699,11 @@ def hash_to_address(hash_hex: str, addr_type: str) -> str:
     """
     try:
         import hashlib
-        
+
+        if COIN == "BCH" and addr_type in ("P2PKH", "P2SH"):
+            # Show Bitcoin Cash outputs in CashAddr format
+            return cashaddr_encode(hash_hex, addr_type) or hash_hex
+
         if addr_type == "P2PKH":
             # Encode as legacy address (1...)
             version = bytes([0])
@@ -745,6 +771,110 @@ def hash_to_address(hash_hex: str, addr_type: str) -> str:
             
     except:
         return hash_hex
+
+
+# ---------------------------------------------------------------------------
+# Bitcoin Cash CashAddr support
+# Spec: https://github.com/bitcoincashorg/bitcoincash.org/blob/master/spec/cashaddr.md
+# A CashAddr address (bitcoincash:q...) encodes exactly the same 20-byte hash as
+# the legacy (1... / 3...) form of the address; only the text encoding differs.
+# ---------------------------------------------------------------------------
+
+CASHADDR_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+CASHADDR_PREFIX = "bitcoincash"
+
+
+def cashaddr_polymod(values) -> int:
+    """CashAddr checksum (BCH code over GF(2^5)), as defined in the spec."""
+    generators = [0x98f2bc8e61, 0x79b76d99e2, 0xf33e5fb3c4, 0xae2eabe2a8, 0x1e4f43e470]
+    c = 1
+    for d in values:
+        c0 = c >> 35
+        c = ((c & 0x07ffffffff) << 5) ^ d
+        for i in range(5):
+            if (c0 >> i) & 1:
+                c ^= generators[i]
+    return c ^ 1
+
+
+def cashaddr_prefix_expand(prefix: str) -> list:
+    return [ord(x) & 0x1f for x in prefix] + [0]
+
+
+def is_cashaddr(address: str) -> bool:
+    """True if the string looks like a CashAddr address (with or without prefix)."""
+    a = address.strip().lower()
+    if a.startswith(CASHADDR_PREFIX + ":"):
+        return True
+    return len(a) == 42 and a[0] in ("q", "p") and all(c in CASHADDR_CHARSET for c in a)
+
+
+def cashaddr_decode(address: str) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    Decode a CashAddr address. The 'bitcoincash:' prefix is optional.
+    Returns (addr_type, hash160_hex, error). On success error is "".
+    addr_type is "P2PKH" or "P2SH".
+    """
+    a = address.strip()
+    if a != a.lower() and a != a.upper():
+        return None, None, "Mixed upper and lower case is not allowed in CashAddr"
+    a = a.lower()
+    if ":" in a:
+        prefix, payload = a.split(":", 1)
+        if prefix != CASHADDR_PREFIX:
+            return None, None, f"Unsupported prefix '{prefix}:' (expected '{CASHADDR_PREFIX}:')"
+    else:
+        prefix, payload = CASHADDR_PREFIX, a
+
+    if not payload or any(c not in CASHADDR_CHARSET for c in payload):
+        return None, None, "Invalid character in CashAddr address"
+
+    data = [CASHADDR_CHARSET.index(c) for c in payload]
+    if cashaddr_polymod(cashaddr_prefix_expand(prefix) + data) != 0:
+        return None, None, "Invalid checksum (address may have a typo)"
+
+    decoded = convertbits(data[:-8], 5, 8, pad=False)
+    if decoded is None or len(decoded) != 21:
+        return None, None, "Unexpected CashAddr payload length (only 20-byte hashes are supported)"
+
+    version = decoded[0]
+    if version == 0:
+        addr_type = "P2PKH"
+    elif version == 8:
+        addr_type = "P2SH"
+    else:
+        return None, None, f"Unsupported CashAddr version byte {version}"
+
+    return addr_type, bytes(decoded[1:]).hex(), ""
+
+
+def cashaddr_encode(hash_hex: str, addr_type: str) -> Optional[str]:
+    """Encode a 20-byte hash as a CashAddr address (bitcoincash:q... / p...)."""
+    version = {"P2PKH": 0, "P2SH": 8}.get(addr_type)
+    if version is None:
+        return None
+    payload = convertbits([version] + list(bytes.fromhex(hash_hex)), 8, 5)
+    checksum = cashaddr_polymod(cashaddr_prefix_expand(CASHADDR_PREFIX) + payload + [0] * 8)
+    payload += [(checksum >> 5 * (7 - i)) & 0x1f for i in range(8)]
+    return CASHADDR_PREFIX + ":" + "".join(CASHADDR_CHARSET[d] for d in payload)
+
+
+def legacy_address(hash_hex: str, addr_type: str) -> Optional[str]:
+    """Encode a 20-byte hash as a legacy Base58Check address (1... / 3...)."""
+    import hashlib
+    version = {"P2PKH": 0, "P2SH": 5}.get(addr_type)
+    if version is None:
+        return None
+    data = bytes([version]) + bytes.fromhex(hash_hex)
+    data += hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
+    alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+    num = int.from_bytes(data, 'big')
+    encoded = ''
+    while num > 0:
+        num, rem = divmod(num, 58)
+        encoded = alphabet[rem] + encoded
+    leading_zeros = len(data) - len(data.lstrip(b'\x00'))
+    return '1' * leading_zeros + encoded
 
 
 def base58_decode(address: str) -> Optional[str]:
@@ -822,8 +952,14 @@ def verify_address_in_outputs(outputs: list, btc_address: str) -> Tuple[bool, st
         # Decode the user's address to get hash
         user_hash = None
         addr_type_expected = None
-        
-        if btc_address.lower().startswith('bc1p'):
+
+        if is_cashaddr(btc_address):
+            # Bitcoin Cash CashAddr (bitcoincash:q... / p...)
+            addr_type_expected, user_hash, err = cashaddr_decode(btc_address)
+            if not user_hash:
+                return False, f"Could not decode CashAddr address: {err}"
+
+        elif btc_address.lower().startswith('bc1p'):
             # Taproot address (bech32m, witness v1)
             user_hash = bech32_decode_simple(btc_address)
             if not user_hash:
@@ -863,12 +999,15 @@ def verify_address_in_outputs(outputs: list, btc_address: str) -> Tuple[bool, st
             # Compare hashes
             if addr_type == addr_type_expected and user_hash:
                 if addr_data.lower() == user_hash.lower():
-                    return True, f"Found in output #{i+1}: {value_btc:.8f} BTC to your {addr_type} address"
-            
-            # Check if address appears as ASCII (some pools do this)
-            addr_ascii = btc_address.encode('utf-8').hex()
-            if addr_ascii in output['script_hex'].lower():
-                return True, f"Found in output #{i+1}: Address as ASCII in script"
+                    return True, f"Found in output #{i+1}: {value_btc:.8f} {COIN} to your {addr_type} address"
+
+            # Check if address appears as ASCII (some pools do this).
+            # Skipped in BCH mode: text in a script is not a payment, so only an
+            # output that actually pays the address's key hash counts as a pass.
+            if COIN != "BCH":
+                addr_ascii = btc_address.encode('utf-8').hex()
+                if addr_ascii in output['script_hex'].lower():
+                    return True, f"Found in output #{i+1}: Address as ASCII in script"
         
         return False, "Address not found in any coinbase outputs"
         
@@ -886,7 +1025,19 @@ def validate_bitcoin_address(address: str) -> Tuple[bool, str]:
     # Check basic format
     if not address or len(address) < 26:
         return False, "Address is too short (minimum 26 characters)"
-    
+
+    # Bitcoin Cash CashAddr (bitcoincash:q... / p...)
+    if is_cashaddr(address):
+        if COIN != "BCH":
+            return False, "This is a Bitcoin Cash (CashAddr) address - add --coin bch"
+        addr_type, _, err = cashaddr_decode(address)
+        return (True, "") if addr_type else (False, err)
+
+    # Bitcoin SegWit/Taproot addresses don't exist on Bitcoin Cash
+    if COIN == "BCH" and address.lower().startswith('bc1'):
+        return False, ("This is a Bitcoin (BTC) address, not Bitcoin Cash. "
+                       "Use your BCH address (bitcoincash:q... or 1...)")
+
     # P2PKH (1...) or P2SH (3...)
     if address.startswith('1') or address.startswith('3'):
         try:
@@ -1325,13 +1476,14 @@ def test_all_address_types(host: str, port: int, timeout: int, password: str) ->
     print("This tool verifies that a solo mining pool is legitimate by:")
     print()
     print("1. CONNECTING as a mining worker to the pool's stratum server")
-    print("2. AUTHORIZING with your Bitcoin address as the username")
+    coin_name = "Bitcoin Cash" if COIN == "BCH" else "Bitcoin"
+    print(f"2. AUTHORIZING with your {coin_name} address as the username")
     print("3. RECEIVING the block template (mining work) from the pool")
     print("4. PARSING the coinbase transaction to see where block rewards go")
     print("5. VERIFYING your address appears in the coinbase outputs")
     print()
     print("WHY THIS MATTERS:")
-    print("In true solo mining, if you find a block, the reward (currently ~3.1 BTC)")
+    print(f"In true solo mining, if you find a block, the reward (currently ~3.1 {COIN})")
     print("should go directly to YOUR address - not the pool's address. This tool")
     print("confirms the pool is configured correctly by checking the actual block")
     print("template they send to miners.")
@@ -1577,8 +1729,34 @@ Note: This tool performs a basic verification. For complete security, you should
     parser.add_argument('--password', default='x', help='Password (default: x)')
     parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds (default: 30)')
     parser.add_argument('--retries', type=int, default=2, help='Number of retries for slow pools (default: 2)')
-    
+    parser.add_argument('--coin', choices=['btc', 'bch'], default=None,
+                        help='Coin the pool mines: btc (default) or bch. '
+                             'Switches to bch automatically for a CashAddr address')
+    parser.add_argument('--tls', action='store_true',
+                        help='Connect over TLS (stratum+ssl) and verify the pool certificate')
+
     args = parser.parse_args()
+
+    global COIN, USE_TLS
+    USE_TLS = args.tls
+    if args.coin:
+        COIN = args.coin.upper()
+    elif args.address and is_cashaddr(args.address):
+        COIN = "BCH"
+
+    # Bitcoin Cash mode needs the miner's own address: the random test address
+    # and the --all-types sample addresses are Bitcoin-only, so a BCH pool can't
+    # pay them and the result would be misleading.
+    if COIN == "BCH" and args.all_types:
+        print("Error: --all-types uses Bitcoin-only sample addresses and can't be used with --coin bch.",
+              file=sys.stderr)
+        sys.exit(1)
+    needs_address = not (args.test_extranonce or args.analyze)
+    if COIN == "BCH" and needs_address and not args.address:
+        print("Error: Bitcoin Cash mode needs YOUR address, e.g.", file=sys.stderr)
+        print(f"  python3 verify_pool.py {args.host} {args.port} bitcoincash:q... --coin bch",
+              file=sys.stderr)
+        sys.exit(1)
     
     # Check for known scam pools
     scam_pools = ['zsolo.bid', 'luckymonster.pro']
@@ -1646,7 +1824,7 @@ Note: This tool performs a basic verification. For complete security, you should
     is_valid, error_msg = validate_bitcoin_address(args.address)
     if not is_valid:
         print("=" * 70)
-        print("❌ INVALID BITCOIN ADDRESS")
+        print("❌ INVALID BITCOIN CASH ADDRESS" if COIN == "BCH" else "❌ INVALID BITCOIN ADDRESS")
         print("=" * 70)
         print()
         print(f"Address: {args.address}")
@@ -1654,6 +1832,12 @@ Note: This tool performs a basic verification. For complete security, you should
         print()
         print("Please check your address and try again.")
         print()
+        if COIN == "BCH":
+            print("Valid Bitcoin Cash address formats:")
+            print("  • CashAddr: bitcoincash:q... or just q... (the 'bitcoincash:' prefix is optional)")
+            print("  • Legacy:   Starts with '1' or '3'")
+            print()
+            return 1
         print("Valid address formats:")
         print("  • P2PKH (Legacy):  Starts with '1' (e.g., 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa)")
         print("  • P2SH:            Starts with '3' (e.g., 3EExK1K1TF3v7zsFtQHt14XqexCwgmXM1y)")
@@ -1672,13 +1856,14 @@ Note: This tool performs a basic verification. For complete security, you should
     print("This tool verifies that a solo mining pool is legitimate by:")
     print()
     print("1. CONNECTING as a mining worker to the pool's stratum server")
-    print("2. AUTHORIZING with your Bitcoin address as the username")
+    coin_name = "Bitcoin Cash" if COIN == "BCH" else "Bitcoin"
+    print(f"2. AUTHORIZING with your {coin_name} address as the username")
     print("3. RECEIVING the block template (mining work) from the pool")
     print("4. PARSING the coinbase transaction to see where block rewards go")
     print("5. VERIFYING your address appears in the coinbase outputs")
     print()
     print("WHY THIS MATTERS:")
-    print("In true solo mining, if you find a block, the reward (currently ~3.1 BTC)")
+    print(f"In true solo mining, if you find a block, the reward (currently ~3.1 {COIN})")
     print("should go directly to YOUR address - not the pool's address. This tool")
     print("confirms the pool is configured correctly by checking the actual block")
     print("template they send to miners.")
@@ -1696,7 +1881,19 @@ Note: This tool performs a basic verification. For complete security, you should
     print("=" * 70)
     print()
     print(f"Pool:    {args.host}:{args.port}")
+    print(f"Coin:    {COIN}")
+    print(f"Link:    {'TLS (encrypted, certificate checked)' if USE_TLS else 'Plain TCP (unencrypted)'}")
     print(f"Address: {args.address}")
+    if COIN == "BCH":
+        # Show both encodings of the user's own address, so outputs can be matched
+        # whichever form the pool or a block explorer displays.
+        if is_cashaddr(args.address):
+            t, h, _ = cashaddr_decode(args.address)
+        else:
+            t, h = ("P2SH" if args.address.startswith('3') else "P2PKH"), base58_decode(args.address)
+        if t and h:
+            print(f"         = {cashaddr_encode(h, t)}")
+            print(f"         = {legacy_address(h, t)} (legacy form)")
     if username != args.address:
         print(f"Username: {username}")
     print()
@@ -1878,9 +2075,9 @@ Note: This tool performs a basic verification. For complete security, you should
         
         if total_value > 0 and value_sats > 0:
             percentage = (value_sats / total_value) * 100
-            print(f"      Amount:  {value_btc:.8f} BTC ({value_sats:,} sats) - {percentage:.2f}%")
+            print(f"      Amount:  {value_btc:.8f} {COIN} ({value_sats:,} sats) - {percentage:.2f}%")
         else:
-            print(f"      Amount:  {value_btc:.8f} BTC ({value_sats:,} sats)")
+            print(f"      Amount:  {value_btc:.8f} {COIN} ({value_sats:,} sats)")
         
         print(f"      Type:    {output['address_type']}")
         
@@ -1903,6 +2100,10 @@ Note: This tool performs a basic verification. For complete security, you should
             address = hash_to_address(output['address_data'], output['address_type'])
             if address and address != output['address_data']:
                 print(f"      Address: {address}")
+            if COIN == "BCH":
+                legacy = legacy_address(output['address_data'], output['address_type'])
+                if legacy:
+                    print(f"      Legacy:  {legacy}")
         else:
             # Unknown script type - show raw hex
             print(f"      Script:  {output['address_data'][:60]}{'...' if len(output['address_data']) > 60 else ''}")
@@ -1914,7 +2115,9 @@ Note: This tool performs a basic verification. For complete security, you should
     if len(paying_outputs) > 1:
         # Determine which output is the user's
         user_hash = None
-        if args.address.lower().startswith('bc1p'):
+        if is_cashaddr(args.address):
+            _, user_hash, _ = cashaddr_decode(args.address)
+        elif args.address.lower().startswith('bc1p'):
             user_hash = bech32_decode_simple(args.address)
         elif args.address.lower().startswith('bc1'):
             user_hash = bech32_decode_simple(args.address)

@@ -1,3 +1,58 @@
+# Bitcoin Cash (BCH) support: fork notes
+
+This is a fork of [mweinberg/stratum-speed-test](https://github.com/mweinberg/stratum-speed-test)
+by Matt Weinberg, adding Bitcoin Cash support to `verify_pool.py`. All credit for the original
+tool goes to him. It remains GPL-3.0.
+
+**Only `verify_pool.py` is changed** (plus new tests in `tests/`). To see every changed line,
+use GitHub's *Compare* view against the original repository.
+
+## Verify a BCH solo pool pays you
+
+```bash
+git clone https://github.com/IanWesterGitHub/stratum-speed-test.git
+cd stratum-speed-test
+python3 verify_pool.py <pool-host> <port> <your-BCH-address> --tls
+```
+
+- **Use your normal BCH address.** CashAddr (`bitcoincash:q...`, with or without the prefix)
+  works directly; BCH mode switches on automatically. A legacy `1...` address also works with
+  `--coin bch`.
+- **`--tls`** connects over stratum+ssl and checks the pool's certificate matches its hostname.
+  Leave it off for plain-TCP ports.
+- Needs only Python 3.6+; no extra packages.
+
+## What changed in BCH mode
+
+- **CashAddr addresses** are decoded per the
+  [CashAddr spec](https://github.com/bitcoincashorg/bitcoincash.org/blob/master/spec/cashaddr.md)
+  and matched against coinbase outputs by their 20-byte hash.
+- **Amounts are labelled BCH**, and each output is shown in both CashAddr and legacy form.
+- **Your own address is required.** Without one, the original falls back to a random Bitcoin
+  `bc1q...` test address, which a BCH pool can't pay, giving a misleading failure. `--all-types`
+  is disabled for the same reason, and `bc1...` addresses are rejected with a clear message.
+- **Text matches don't count.** The original also passes if your address appears as text inside
+  an output script. In BCH mode only an output that actually pays your address's key hash counts,
+  so a pool can't pass by writing your address into a zero-value output while paying itself.
+- **New `--tls` option** (works in BTC mode too).
+
+Bitcoin (BTC) behaviour is unchanged unless you pass `--tls`.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+- `tests/test_cashaddr.py` checks the decoder against the CashAddr spec's published examples.
+- `tests/test_verify_bch.py` runs the real script against a local fake pool: an honest pool
+  passes (plain and TLS); a pool paying itself fails; the address-as-text trick fails; a TLS
+  certificate for the wrong hostname is rejected.
+
+---
+
+*The original README follows.*
+
 # Bitcoin Solo Mining Pool Speed Test
 
 A cross-platform Python tool to help Bitcoin solo miners find the fastest public stratum mining pool server from their location.
