@@ -80,6 +80,12 @@ COIN = "BTC"
 # When True, connect to the pool over TLS (stratum+ssl) and verify its certificate.
 USE_TLS = False
 
+# Seconds to wait for the pool's reply to mining.authorize.
+AUTH_TIMEOUT = 10
+
+# Machine-readable summary of the run, printed as JSON with --json.
+REPORT = {}
+
 
 def connect_and_subscribe(host: str, port: int, timeout: int = 10) -> Tuple[Optional[socket.socket], Optional[dict]]:
     """
@@ -175,26 +181,43 @@ def authorize_worker(sock: socket.socket, username: str, password: str = "x") ->
         
         sock.sendall(authorize_msg.encode('utf-8'))
         
-        # Receive response - may need multiple reads for slow connections
-        # Wait a bit for the response to arrive
-        time.sleep(0.3)
-        
+        # Keep reading until the pool's reply to this authorize request
+        # (id 2) arrives, or the deadline passes. Some pools take several
+        # seconds to check a new address (e.g. just after a restart), so
+        # giving up after the first quiet moment caused false failures.
         response_parts = []
-        sock.settimeout(2)  # Shorter timeout for subsequent reads
-        
-        try:
-            # Try to read multiple times to get complete response
-            for _ in range(3):
+        buffer = ""
+        got_reply = False
+        deadline = time.time() + AUTH_TIMEOUT
+
+        while not got_reply and time.time() < deadline:
+            sock.settimeout(max(0.1, deadline - time.time()))
+            try:
+                chunk = sock.recv(8192).decode('utf-8')
+            except socket.timeout:
+                break
+            if not chunk:
+                break  # Connection closed by the pool
+            response_parts.append(chunk)
+            buffer += chunk
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                try:
+                    if json.loads(line).get('id') == 2:
+                        got_reply = True
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+
+        # Collect anything else already sent alongside the reply (work, difficulty)
+        if got_reply:
+            sock.settimeout(0.3)
+            try:
                 chunk = sock.recv(8192).decode('utf-8')
                 if chunk:
                     response_parts.append(chunk)
-                    # If we got a complete response, break
-                    if '\n' in chunk and '"id":2' in chunk:
-                        break
-                time.sleep(0.1)
-        except socket.timeout:
-            pass  # Normal - no more data
-        
+            except socket.timeout:
+                pass
+
         response = ''.join(response_parts).strip()
         
         if not response:
@@ -1127,6 +1150,13 @@ def generate_random_p2wpkh_address() -> str:
     return address
 
 
+def generate_random_bch_address() -> str:
+    """A valid but random CashAddr P2PKH address that nobody holds the key for.
+    Used for automated checks so the pool can't recognise a fixed test address."""
+    import os
+    return cashaddr_encode(os.urandom(20).hex(), "P2PKH")
+
+
 def validate_extranonce1(subscribe_response: dict) -> Dict:
     """
     Validate and analyze extranonce1 from mining.subscribe response.
@@ -1734,6 +1764,13 @@ Note: This tool performs a basic verification. For complete security, you should
                              'Switches to bch automatically for a CashAddr address')
     parser.add_argument('--tls', action='store_true',
                         help='Connect over TLS (stratum+ssl) and verify the pool certificate')
+    parser.add_argument('--json', action='store_true',
+                        help='Print a machine-readable JSON summary on stdout '
+                             '(the normal human-readable output goes to stderr)')
+    parser.add_argument('--random-address', action='store_true',
+                        help='BCH mode: test with a freshly generated random address that nobody '
+                             'holds, so a pool cannot recognise a known test address. '
+                             'Only the block template is checked; no shares are submitted')
 
     args = parser.parse_args()
 
@@ -1751,6 +1788,12 @@ Note: This tool performs a basic verification. For complete security, you should
         print("Error: --all-types uses Bitcoin-only sample addresses and can't be used with --coin bch.",
               file=sys.stderr)
         sys.exit(1)
+    if args.random_address:
+        if COIN != "BCH" or args.address:
+            print("Error: --random-address needs --coin bch and no address argument", file=sys.stderr)
+            sys.exit(1)
+        args.address = generate_random_bch_address()
+        print(f"Using random test address: {args.address}")
     needs_address = not (args.test_extranonce or args.analyze)
     if COIN == "BCH" and needs_address and not args.address:
         print("Error: Bitcoin Cash mode needs YOUR address, e.g.", file=sys.stderr)
@@ -1797,6 +1840,9 @@ Note: This tool performs a basic verification. For complete security, you should
     # Handle --test-extranonce mode
     if args.test_extranonce:
         result = test_extranonce1_uniqueness(args.host, args.port, args.timeout, num_tests=5)
+        REPORT.update(mode="extranonce", result="passed" if result['status'] != 'critical' else "failed",
+                      extranonce_values=result['extranonce1_values'],
+                      all_unique=result['all_unique'])
         return 0 if result['status'] != 'critical' else 1
     
     # Handle --analyze mode
@@ -1848,6 +1894,8 @@ Note: This tool performs a basic verification. For complete security, you should
         return 1
     
     username = args.username or args.address
+    REPORT.update(mode="verify", host=args.host, port=args.port, coin=COIN, tls=USE_TLS,
+                  address=args.address, username=username)
     
     print("=" * 70)
     print("SOLO MINING POOL VERIFICATION")
@@ -1904,10 +1952,12 @@ Note: This tool performs a basic verification. For complete security, you should
     
     if not sock:
         print("❌ Failed to connect to pool")
+        REPORT.update(result="connect_failed")
         return 1
     
     if not subscribe_response or 'result' not in subscribe_response:
         print("❌ Invalid subscribe response")
+        REPORT.update(result="connect_failed")
         sock.close()
         return 1
     
@@ -1917,6 +1967,7 @@ Note: This tool performs a basic verification. For complete security, you should
     # Validate and display extranonce1
     print("\n[1.5/5] Validating extranonce1...")
     extranonce1_info = validate_extranonce1(subscribe_response)
+    REPORT.update(extranonce1=extranonce1_info['value'], extranonce1_bytes=extranonce1_info['size_bytes'])
     
     if not extranonce1_info['exists']:
         print("❌ Extranonce1 missing or invalid")
@@ -1950,6 +2001,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     if not authorized:
         print("❌ Authorization failed")
+        REPORT.update(result="auth_refused")
         sock.close()
         return 1
     
@@ -1991,6 +2043,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     if not notify_params:
         print(f"❌ Did not receive mining.notify after {args.retries + 1} attempts")
+        REPORT.update(result="no_work")
         print("    This pool may be very slow or not responding properly.")
         print("    Try increasing --timeout or --retries, or test a different pool.")
         return 1
@@ -2009,6 +2062,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     job_id = notify_params[0]
     prevhash = notify_params[1]
+    REPORT.update(prevhash=prevhash, difficulty=difficulty)
     coinb1 = notify_params[2]
     coinb2 = notify_params[3]
     
@@ -2022,6 +2076,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     # Parse coinb1 (beginning of script)
     script_info = parse_coinbase_script(coinb1)
+    REPORT.update(block_height=script_info.get('block_height'))
     
     if 'error' in script_info:
         print(f"    ⚠️  Could not parse coinbase script prefix: {script_info['error']}")
@@ -2031,6 +2086,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     # Parse coinb2 (end of script - where pool signature usually is)
     script_suffix = parse_coinbase_script_suffix(coinb2)
+    REPORT.update(pool_signature=script_suffix.get('readable_strings', []))
     
     if 'error' not in script_suffix:
         if script_suffix['readable_strings']:
@@ -2056,6 +2112,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     if not outputs:
         print("❌ Could not parse coinbase outputs")
+        REPORT.update(result="parse_failed")
         print("\nCoinbase hex (first 200 chars):")
         print(f"  {coinb1 + coinb2[:200]}...")
         return 1
@@ -2065,6 +2122,14 @@ Note: This tool performs a basic verification. For complete security, you should
     
     # Calculate total value (excluding OP_RETURN which has 0 value)
     total_value = sum(o['value_satoshis'] for o in outputs)
+    REPORT.update(total_satoshis=total_value, outputs=[
+        {"type": o['address_type'],
+         "address": hash_to_address(o['address_data'], o['address_type'])
+                    if o['address_type'] not in ('OP_RETURN', 'unknown') else None,
+         "satoshis": o['value_satoshis'],
+         "percent": round(o['value_satoshis'] * 100 / total_value, 4) if total_value else 0}
+        for o in outputs])
+    REPORT.update(paying_outputs=sum(1 for o in outputs if o['value_satoshis'] > 0))
     
     for i, output in enumerate(outputs, 1):
         print(f"    Output #{i}:")
@@ -2146,6 +2211,7 @@ Note: This tool performs a basic verification. For complete security, you should
     
     # Verify if user's address is in the outputs
     found, details = verify_address_in_outputs(outputs, args.address)
+    REPORT.update(result="passed" if found else "address_not_found", details=details)
     
     print("=" * 70)
     if found:
@@ -2180,5 +2246,25 @@ Note: This tool performs a basic verification. For complete security, you should
         return 1
 
 
+def run_with_optional_json():
+    """With --json, send the normal output to stderr and print one JSON summary on stdout."""
+    if '--json' not in sys.argv:
+        return main()
+    real_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    code = 1
+    try:
+        code = main()
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+    finally:
+        sys.stdout = real_stdout
+        REPORT.setdefault("result", "error")
+        REPORT["exit_code"] = code
+        REPORT["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        print(json.dumps(REPORT, indent=2))
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_with_optional_json())

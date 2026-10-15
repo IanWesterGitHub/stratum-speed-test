@@ -35,6 +35,12 @@ python3 verify_pool.py <pool-host> <port> <your-BCH-address> --tls
   an output script. In BCH mode only an output that actually pays your address's key hash counts,
   so a pool can't pass by writing your address into a zero-value output while paying itself.
 - **New `--tls` option** (works in BTC mode too).
+- **`--json`** prints a machine-readable summary on stdout (verdict, outputs and percentages,
+  block height, TLS) for automated checks; the normal output goes to stderr.
+- **`--random-address`** (BCH mode) tests with a freshly generated address nobody holds, so a
+  pool can't recognise a fixed test address. Only the block template is checked; no shares are sent.
+- **More patient login:** waits up to 10 seconds for the pool's reply to `mining.authorize`,
+  instead of giving up after about 2 seconds of silence (pools can be slow to check a new address).
 
 Bitcoin (BTC) behaviour is unchanged unless you pass `--tls`.
 

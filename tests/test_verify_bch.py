@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -49,7 +50,7 @@ def output(value, script):
     return value.to_bytes(8, "little") + bytes([len(script)]) + script
 
 
-def build_coinbase(mode):
+def build_coinbase(mode, username=None):
     """Return (coinb1_hex, coinb2_hex) for a BCH-style coinbase (no SegWit)."""
     tag = b"/TestPool/"
     extranonce_len = 4 + 8
@@ -60,6 +61,10 @@ def build_coinbase(mode):
 
     if mode == "honest":
         outs = [output(REWARD, p2pkh(USER_HASH))]
+    elif mode == "pays_username":
+        # Pay whatever address the miner logged in with, like a real solo pool
+        _, h, _ = vp.cashaddr_decode(username.split(".")[0])
+        outs = [output(REWARD, p2pkh(h))]
     elif mode == "pays_pool":
         outs = [output(REWARD, p2pkh(POOL_HASH))]
     elif mode == "ascii_trick":
@@ -75,9 +80,10 @@ def build_coinbase(mode):
 
 
 class FakePool:
-    def __init__(self, mode, tls_context=None):
+    def __init__(self, mode, tls_context=None, auth_delay=0):
         self.mode = mode
         self.tls_context = tls_context
+        self.auth_delay = auth_delay
         self.server = socket.socket()
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server.bind(("127.0.0.1", 0))
@@ -99,7 +105,6 @@ class FakePool:
             if self.tls_context:
                 conn = self.tls_context.wrap_socket(conn, server_side=True)
             buf = b""
-            coinb1, coinb2 = build_coinbase(self.mode)
             while True:
                 data = conn.recv(4096)
                 if not data:
@@ -115,6 +120,9 @@ class FakePool:
                                  "error": None}
                         conn.sendall((json.dumps(reply) + "\n").encode())
                     elif msg["method"] == "mining.authorize":
+                        if self.auth_delay:
+                            time.sleep(self.auth_delay)  # e.g. a pool checking a new address
+                        coinb1, coinb2 = build_coinbase(self.mode, msg["params"][0])
                         replies = [
                             {"id": msg["id"], "result": True, "error": None},
                             {"id": None, "method": "mining.set_difficulty", "params": [1024]},
@@ -179,6 +187,49 @@ class TestVerifyBCH(unittest.TestCase):
         code, out = run_verifier("127.0.0.1", "1", "--coin", "bch")
         self.assertEqual(code, 1)
         self.assertIn("needs YOUR address", out)
+
+    def test_json_summary(self):
+        code, out = self.run_against("honest", extra=("--json",))
+        self.assertEqual(code, 0, out)
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        self.assertEqual(report["result"], "passed")
+        self.assertEqual(report["coin"], "BCH")
+        self.assertEqual(report["paying_outputs"], 1)
+        self.assertEqual(report["outputs"][0]["percent"], 100.0)
+        self.assertEqual(report["outputs"][0]["address"], USER_CASH)
+        self.assertEqual(report["block_height"], 972699)
+
+    def test_json_summary_on_failure(self):
+        code, out = self.run_against("pays_pool", extra=("--json",))
+        self.assertEqual(code, 1, out)
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        self.assertEqual(report["result"], "address_not_found")
+
+    def test_random_address_is_the_one_paid(self):
+        pool = FakePool("pays_username")
+        try:
+            code, out = run_verifier("127.0.0.1", str(pool.port), "--coin", "bch", "--random-address",
+                                     "--json", "--timeout", "5", "--retries", "0")
+        finally:
+            pool.close()
+        self.assertEqual(code, 0, out)
+        report = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        self.assertEqual(report["result"], "passed")
+        self.assertNotEqual(report["address"], USER_CASH)
+        self.assertEqual(report["outputs"][0]["address"], report["address"])
+
+    def test_random_address_differs_each_run(self):
+        self.assertNotEqual(vp.generate_random_bch_address(), vp.generate_random_bch_address())
+
+    def test_slow_login_reply_still_passes(self):
+        pool = FakePool("honest", auth_delay=3)
+        try:
+            code, out = run_verifier("127.0.0.1", str(pool.port), USER_CASH,
+                                     "--timeout", "5", "--retries", "0")
+        finally:
+            pool.close()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Worker authorized", out)
 
     def test_btc_address_rejected_in_bch_mode(self):
         code, out = run_verifier("127.0.0.1", "1", "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
