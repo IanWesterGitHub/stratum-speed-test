@@ -1947,7 +1947,7 @@ Note: This tool performs a basic verification. For complete security, you should
     print()
     
     # Step 1: Connect and subscribe
-    print("[1/4] Connecting to pool...")
+    print("[1/6] Connecting to pool...")
     sock, subscribe_response = connect_and_subscribe(args.host, args.port, args.timeout)
     
     if not sock:
@@ -1965,7 +1965,7 @@ Note: This tool performs a basic verification. For complete security, you should
     print(f"    Subscription ID: {subscribe_response.get('id')}")
     
     # Validate and display extranonce1
-    print("\n[1.5/5] Validating extranonce1...")
+    print("\n[2/6] Validating extranonce1...")
     extranonce1_info = validate_extranonce1(subscribe_response)
     REPORT.update(extranonce1=extranonce1_info['value'], extranonce1_bytes=extranonce1_info['size_bytes'])
     
@@ -1996,7 +1996,7 @@ Note: This tool performs a basic verification. For complete security, you should
         print(f"    Status:          ❌ Critical")
     
     # Step 2: Authorize
-    print("\n[2/5] Authorizing worker...")
+    print("\n[3/6] Authorizing worker...")
     authorized, notify_params, difficulty = authorize_worker(sock, username, args.password)
     
     if not authorized:
@@ -2009,9 +2009,9 @@ Note: This tool performs a basic verification. For complete security, you should
     
     # Step 3: Wait for mining.notify (if not already received)
     if notify_params:
-        print("\n[3/5] Block template received with authorization ✓")
+        print("\n[4/6] Block template received with authorization ✓")
     else:
-        print("\n[3/5] Waiting for block template (mining.notify)...")
+        print("\n[4/6] Waiting for block template (mining.notify)...")
         print(f"    (timeout: {args.timeout} seconds, retries: {args.retries})")
         
         # Try with retries for slow pools
@@ -2072,7 +2072,7 @@ Note: This tool performs a basic verification. For complete security, you should
     print(f"    Coinbase part 2 length: {len(coinb2)} chars")
     
     # Parse coinbase script for block height and pool signature
-    print("\n[4/5] Parsing coinbase script (block height & pool signature)...")
+    print("\n[5/6] Parsing coinbase script (block height & pool signature)...")
     
     # Parse coinb1 (beginning of script)
     script_info = parse_coinbase_script(coinb1)
@@ -2103,7 +2103,7 @@ Note: This tool performs a basic verification. For complete security, you should
                     print(f"                           {ascii_text[80:160]}")
     
     # Step 5: Parse and verify coinbase outputs
-    print("\n[5/5] Parsing coinbase transaction outputs...")
+    print("\n[6/6] Parsing coinbase transaction outputs...")
     
     # Reconstruct the full coinbase (coinb1 + extranonce1 + extranonce2 + coinb2)
     # and parse its outputs deterministically.
